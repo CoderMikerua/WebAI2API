@@ -112,8 +112,7 @@ async function generateImage(context, prompt, imgPaths, modelId, meta = {}) {
         await waitForPageAuth(page);
 
         logger.info('适配器', '开启新会话', meta);
-        const gotoResult = await gotoWithCheck(page, targetUrl);
-        if (gotoResult.error) return gotoResult;
+        await gotoWithCheck(page, targetUrl);
 
         // 如果触发了账户选择跳转，等待全局处理器完成
         await waitForPageAuth(page);
