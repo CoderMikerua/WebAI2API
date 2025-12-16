@@ -56,6 +56,7 @@ function parseError(code, customMessage) {
  * @param {string} options.backendName - 后端名称
  * @param {Function} options.resolveModelId - 模型 ID 解析函数
  * @param {Function} options.getImagePolicy - 获取图片策略函数
+ * @param {Function} options.getModelType - 获取模型类型函数
  * @param {string} options.requestId - 请求 ID
  * @param {Function} options.logger - 日志函数
  * @returns {Promise<ParseResult>} 解析结果
@@ -67,6 +68,7 @@ export async function parseRequest(data, options) {
         backendName,
         resolveModelId,
         getImagePolicy,
+        getModelType,
         requestId,
         logger
     } = options;
@@ -79,6 +81,156 @@ export async function parseRequest(data, options) {
         return parseError(ERROR_CODES.NO_MESSAGES);
     }
 
+    // 1. 解析模型参数与类型
+    let modelKey = null;
+    let isTextMode = false;
+
+    if (data.model) {
+        const resolved = resolveModelId(data.model);
+        if (resolved) {
+            modelKey = data.model;
+            logger.info('服务器', `触发模型: ${data.model}`, { id: requestId });
+
+            // 判定是否为文本模式
+            const type = getModelType ? getModelType(data.model) : 'image';
+            isTextMode = type === 'text';
+
+            if (isTextMode) {
+                logger.info('服务器', '解析模式: 文本对话 (虚拟上下文构建)', { id: requestId });
+            } else {
+                logger.info('服务器', '解析模式: 图像生成 (仅取最后一条)', { id: requestId });
+            }
+
+        } else {
+            return parseError(ERROR_CODES.INVALID_MODEL, `模型无效/后端 ${backendName} 不支持: ${data.model}`);
+        }
+    } else {
+        logger.info('服务器', '未指定模型，使用网页默认', { id: requestId });
+    }
+
+    // ============================================================
+    // 分支 A: 文本模型解析 (构建虚拟上下文)
+    // ============================================================
+    if (isTextMode) {
+        return await parseTextRequest(messages, tempDir, imageLimit, modelKey, isStreaming);
+    }
+
+    // ============================================================
+    // 分支 B: 生图模型解析 (原有逻辑)
+    // ============================================================
+    return await parseImageRequest(messages, tempDir, imageLimit, modelKey, isStreaming, getImagePolicy);
+}
+
+/**
+ * 解析文本请求 (构建虚拟上下文)
+ */
+async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStreaming) {
+    let systemPrompt = '';
+    let historyPrompt = '';
+    let currentPrompt = '';
+
+    const imagePaths = [];
+    let globalImageCount = 0;
+
+    // 辅助函数：处理单条消息内容
+    async function processContent(content) {
+        let textBuffer = '';
+        if (typeof content === 'string') {
+            textBuffer += content;
+        } else if (Array.isArray(content)) {
+            for (const item of content) {
+                if (item.type === 'text') {
+                    textBuffer += item.text;
+                } else if (item.type === 'image_url' && item.image_url?.url) {
+                    globalImageCount++;
+
+                    // 图片数量限制检查
+                    if (imageLimit > 0 && globalImageCount > imageLimit) {
+                        textBuffer += `[图片${globalImageCount} (已忽略:超过限制)]`;
+                        continue;
+                    }
+
+                    const url = item.image_url.url;
+                    if (url.startsWith('data:image')) {
+                        const imagePath = await saveBase64Image(url, tempDir);
+                        if (imagePath) {
+                            imagePaths.push(imagePath);
+                            // 插入占位符
+                            textBuffer += `[图片${globalImageCount}]`;
+                        } else {
+                            textBuffer += `[图片${globalImageCount} (上传失败)]`;
+                        }
+                    } else {
+                        textBuffer += `[图片${globalImageCount} (无效链接)]`;
+                    }
+                }
+            }
+        }
+        return textBuffer;
+    }
+
+    // 1. 提取 System Prompt
+    const systemMsg = messages.find(m => m.role === 'system');
+    if (systemMsg) {
+        const content = await processContent(systemMsg.content);
+        if (content) {
+            systemPrompt = `=== 系统指令 (永远置顶) ===\n${content}\n\n`;
+        }
+    }
+
+    // 2. 区分历史和当前消息
+    // 找到最后一条 user 消息的索引
+    let lastUserIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+            lastUserIndex = i;
+            break;
+        }
+    }
+
+    if (lastUserIndex === -1) {
+        return parseError(ERROR_CODES.NO_USER_MESSAGES);
+    }
+
+    // 3. 构建历史对话 (不包含 system 和 最后一条 user)
+    const historyMessages = messages.filter((m, index) => {
+        return m.role !== 'system' && index < lastUserIndex;
+    });
+
+    if (historyMessages.length > 0) {
+        historyPrompt += `=== 历史对话 (滑动窗口或摘要) ===\n`;
+        for (const msg of historyMessages) {
+            const roleName = msg.role === 'user' ? 'User' : 'AI';
+            const content = await processContent(msg.content);
+            historyPrompt += `${roleName}: ${content}\n`;
+        }
+        historyPrompt += `\n`;
+    }
+
+    // 4. 构建当前输入
+    const lastUserMsg = messages[lastUserIndex];
+    const currentContent = await processContent(lastUserMsg.content);
+    currentPrompt = `=== 当前输入 ===\nUser: ${currentContent}`;
+
+    // 5. 合并最终 Prompt
+    const finalPrompt = systemPrompt + historyPrompt + currentPrompt;
+
+    return {
+        success: true,
+        data: {
+            prompt: finalPrompt,
+            imagePaths,
+            modelId,
+            modelName: modelId,
+            isStreaming
+        }
+    };
+}
+
+/**
+ * 解析生图请求 (原有逻辑)
+ */
+async function parseImageRequest(messages, tempDir, imageLimit, modelId, isStreaming, getImagePolicy) {
     // 筛选用户消息
     const userMessages = messages.filter(m => m.role === 'user');
     if (userMessages.length === 0) {
@@ -127,31 +279,16 @@ export async function parseRequest(data, options) {
 
     prompt = prompt.trim();
 
-    // 解析模型参数
-    let modelKey = null;
-    if (data.model) {
-        // 只校验模型是否支持，不解析
-        const resolved = resolveModelId(data.model);
-        if (resolved) {
-            modelKey = data.model;  // 保留原始 modelKey，由 PoolManager 自行解析
-            logger.info('服务器', `触发模型: ${data.model}`, { id: requestId });
-        } else {
-            return parseError(ERROR_CODES.INVALID_MODEL, `模型无效/后端 ${backendName} 不支持: ${data.model}`);
-        }
-    } else {
-        logger.info('服务器', '未指定模型，使用网页默认', { id: requestId });
-    }
-
     // 图片策略校验
     const hasImage = imagePaths.length > 0;
-    const policy = data.model ? getImagePolicy(data.model) : IMAGE_POLICY.OPTIONAL;
+    const policy = modelId ? getImagePolicy(modelId) : IMAGE_POLICY.OPTIONAL;
 
     if (policy === IMAGE_POLICY.REQUIRED && !hasImage) {
-        return parseError(ERROR_CODES.IMAGE_REQUIRED, `模型 ${data.model} 需要参考图`);
+        return parseError(ERROR_CODES.IMAGE_REQUIRED, `模型 ${modelId} 需要参考图`);
     }
 
     if (policy === IMAGE_POLICY.FORBIDDEN && hasImage) {
-        return parseError(ERROR_CODES.IMAGE_FORBIDDEN, `模型 ${data.model} 不支持图片输入`);
+        return parseError(ERROR_CODES.IMAGE_FORBIDDEN, `模型 ${modelId} 不支持图片输入`);
     }
 
     return {
@@ -159,8 +296,8 @@ export async function parseRequest(data, options) {
         data: {
             prompt,
             imagePaths,
-            modelId: modelKey,  // 返回原始 modelKey
-            modelName: data.model || null,
+            modelId,
+            modelName: modelId,
             isStreaming
         }
     };
