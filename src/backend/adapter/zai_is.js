@@ -164,30 +164,79 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         await fillPrompt(page, INPUT_SELECTOR, prompt, meta);
         await sleep(500, 1000);
 
-        // 4. 设置请求拦截器 - 修改 chat/completions 请求中的 model 参数
-        logger.debug('适配器', '已启用请求拦截', meta);
-        await page.unroute('**/*').catch(() => { });
+        // 4. 通过 UI 交互选择模型
+        const modelConfig = manifest.models.find(m => m.id === modelId);
+        const targetModel = modelConfig?.codeName || modelId;
 
-        await page.route(url => url.href.includes('chat/completions'), async (route) => {
-            const request = route.request();
-            if (request.method() !== 'POST') return route.continue();
+        logger.debug('适配器', `正在选择模型: ${targetModel}`, meta);
 
-            try {
-                const postData = request.postDataJSON();
-                if (postData) {
-                    logger.debug('适配器', '已拦截 chat/completions 请求，正在修改 model...', meta);
-                    postData.model = modelId;
-                    logger.info('适配器', `已拦截请求，使用模型: ${modelId}`, meta);
-                    await route.continue({ postData: JSON.stringify(postData) });
-                    return;
-                }
-            } catch (e) {
-                logger.error('适配器', '请求拦截处理失败', { ...meta, error: e.message });
+        // 点击 "Select a models" 按钮
+        const selectModelBtn = page.getByRole('button', { name: 'Select a model' });
+        await selectModelBtn.waitFor({ timeout: 5000 });
+        await sleep(300, 500);
+        await safeClick(page, selectModelBtn, { bias: 'button' });
+        await sleep(500, 800);
+
+        // 在 "Search In Models" 文本框中输入模型名称
+        const searchInput = page.getByRole('textbox', { name: 'Search In Models' });
+        await searchInput.waitFor({ timeout: 5000 });
+        await searchInput.fill(targetModel);
+        await sleep(300, 500);
+
+        // 按回车确认选择
+        await searchInput.press('Enter');
+        await sleep(500, 1000);
+
+        logger.info('适配器', `已选择模型: ${targetModel}`, meta);
+
+        // 5. 检查 GIF Generation 按钮状态，确保为 OFF
+        const gifBtn = page.getByRole('button', { name: /^GIF Generation/ });
+        const gifBtnExists = await gifBtn.count();
+        if (gifBtnExists > 0) {
+            const gifState = await gifBtn.evaluate(el => {
+                const generic = el.querySelector('[role="generic"]') || el;
+                return generic.textContent?.trim() || '';
+            });
+
+            if (!gifState.includes('OFF')) {
+                logger.debug('适配器', `GIF Generation 当前为 ${gifState}，正在切换为 OFF`, meta);
+                await safeClick(page, gifBtn, { bias: 'button' });
+                await sleep(300, 500);
             }
-            await route.continue();
-        });
+        }
 
-        // 5. 提交
+        // 6. 设置图片大小 (如果模型配置了 imageSize)
+        if (modelConfig?.imageSize) {
+            const targetSize = modelConfig.imageSize;  // 例如 "1K", "2K", "4K"
+            logger.debug('适配器', `正在设置图片大小: ${targetSize}`, meta);
+
+            const imageSizeBtn = page.getByRole('button', { name: /^Image Size/ });
+            const btnExists = await imageSizeBtn.count();
+
+            if (btnExists > 0) {
+                // 最多点击 4 次切换
+                for (let i = 0; i < 4; i++) {
+                    // 获取当前图片大小 (从按钮下的 generic 元素中的 text leaf 获取)
+                    const currentSize = await imageSizeBtn.evaluate(el => {
+                        const generic = el.querySelector('[role="generic"]') || el;
+                        return generic.textContent?.trim() || '';
+                    });
+
+                    if (currentSize.includes(targetSize)) {
+                        logger.info('适配器', `图片大小已设置为: ${targetSize}`, meta);
+                        break;
+                    }
+
+                    // 点击切换
+                    await safeClick(page, imageSizeBtn, { bias: 'button' });
+                    await sleep(300, 500);
+                }
+            } else {
+                logger.debug('适配器', '未找到 Image Size 按钮', meta);
+            }
+        }
+
+        // 7. 提交
         logger.debug('适配器', '点击发送...', meta);
         await submit(page, {
             btnSelector: 'button[type="submit"]',
@@ -197,7 +246,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         logger.info('适配器', '等待生成结果中...', meta);
 
-        // 6. 等待 v1/chats/new 响应 (状态码 200 且响应体中有 id)
+        // 8. 等待 v1/chats/new 响应 (状态码 200 且响应体中有 id)
         let chatsNewResponse;
         try {
             chatsNewResponse = await waitApiResponse(page, {
@@ -231,7 +280,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             return { error: '解析对话响应失败' };
         }
 
-        // 7. 等待 chat/completions 响应 (状态码 200 且 status: true)
+        // 9. 等待 chat/completions 响应 (状态码 200 且 status: true)
         let completionsResponse;
         try {
             completionsResponse = await waitApiResponse(page, {
@@ -264,7 +313,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             return { error: '解析生成响应失败' };
         }
 
-        // 8. 等待 chat/completed 响应，从中提取图片链接
+        // 10. 等待 chat/completed 响应，从中提取图片链接
         logger.debug('适配器', '正在等待完成响应...', meta);
 
         let completedResponse;
@@ -309,8 +358,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             return { error: '回复内容为空可能触发违规/限流' };
         }
 
-        // 从 content 中提取图片链接 (格式: ![image](https://zai.is/media/xxx.jpg))
-        const imageUrlMatch = content.match(/!\[.*?\]\((https:\/\/zai\.is\/media\/[^)]+)\)/);
+        // 从 content 中提取图片链接 (格式: ![...](https://zai.is/...))
+        const imageUrlMatch = content.match(/!\[.*?\]\((https:\/\/zai\.is\/[^)]+)\)/);
         if (!imageUrlMatch || !imageUrlMatch[1]) {
             logger.warn('适配器', '回复中未找到图片链接', meta);
             return { error: '回复中未找到图片链接' };
@@ -336,8 +385,6 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         logger.error('适配器', '生成任务失败', { ...meta, error: err.message });
         return { error: `生成任务失败: ${err.message}` };
     } finally {
-        // 清理拦截器
-        await page.unroute('**/*').catch(() => { });
         // 任务结束，将鼠标移至安全区域
         await moveMouseAway(page);
     }
@@ -357,8 +404,10 @@ export const manifest = {
 
     // 模型列表
     models: [
-        { id: 'gemini-3-pro-image-preview', imagePolicy: 'optional' },
-        { id: 'gemini-2.5-flash-image', imagePolicy: 'optional' }
+        { id: 'gemini-3-pro-image-preview', codeName: 'Nano Banana Pro', imagePolicy: 'optional', imageSize: '1K' },
+        { id: 'gemini-3-pro-image-preview-2k', codeName: 'Nano Banana Pro', imagePolicy: 'optional', imageSize: '2K' },
+        { id: 'gemini-3-pro-image-preview-4k', codeName: 'Nano Banana Pro', imagePolicy: 'optional', imageSize: '4K' },
+        { id: 'gemini-2.5-flash-image', codeName: 'Nano Banana', imagePolicy: 'optional' }
     ],
 
     // 导航处理器
